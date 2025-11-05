@@ -1,0 +1,164 @@
+
+===========================================================================================================================
+Your C++ project directory should look like this:
+===========================================================================================================================
+
+my-cpp-app/
+├── .gitlab-ci.yml    <-- The pipeline configuration (from previous response)
+├── CMakeLists.txt    <-- The main build configuration
+├── src/
+│   ├── main.cpp      <-- The main application logic
+│   └── calculator.cpp
+│   └── calculator.h
+└── tests/
+    ├── CMakeLists.txt  <-- Test-specific configuration
+    └── unit_test.cpp   <-- Google Test/Catch2 tests
+
+===========================================================================================================================
+This file tells CMake how to compile the application, set up the tests, and configure coverage reporting
+===========================================================================================================================
+
+# my-cpp-app/CMakeLists.txt
+
+cmake_minimum_required(VERSION 3.12)
+project(MyCppApp VERSION 1.0)
+
+# Set the standard for modern C++
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED True)
+
+# ------------------------------------------------------------------
+# 1. Coverage Configuration
+# ------------------------------------------------------------------
+# Only add coverage flags if the ENABLE_COVERAGE option is ON (set in the prepare job)
+option(ENABLE_COVERAGE "Enable code coverage flags" OFF)
+if(ENABLE_COVERAGE)
+    message(STATUS "Enabling GCOV flags for code coverage.")
+    # Add compiler flags for coverage data collection (GCC/Clang)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ftest-coverage -fprofile-arcs -O0 -g")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-arcs -ftest-coverage")
+endif()
+
+# ------------------------------------------------------------------
+# 2. Application Build
+# ------------------------------------------------------------------
+add_executable(app_binary
+    src/main.cpp
+    src/calculator.cpp
+    src/calculator.h
+)
+
+# ------------------------------------------------------------------
+# 3. Include Test Subdirectory
+# ------------------------------------------------------------------
+# This links the main application code to the test runner
+add_subdirectory(tests)
+
+===========================================================================================================================
+Sample C++ Code.
+===========================================================================================================================
+// my-cpp-app/src/calculator.h
+#ifndef CALCULATOR_H
+#define CALCULATOR_H
+
+class Calculator {
+public:
+    int add(int a, int b) {
+        return a + b;
+    }
+    int subtract(int a, int b) {
+        if (a > b) {
+            return a - b;
+        } else {
+            // This 'else' branch is deliberately left uncovered for the coverage report
+            return b - a;
+        }
+    }
+};
+
+#endif // CALCULATOR_H
+
+// my-cpp-app/src/calculator.cpp
+#include "calculator.h"
+// Implementation is often minimal in header/source split for simple classes.
+
+===========================================================================================================================
+Test CMake (tests/CMakeLists.txt) : This configures CTest and links the Google Test framework (assuming it's available on the base image or installed in the prepare stage).
+===========================================================================================================================
+# my-cpp-app/tests/CMakeLists.txt
+
+# Find GTest (or Catch2, etc.)
+find_package(GTest CONFIG REQUIRED)
+
+# Add the executable for our unit tests
+add_executable(unit_tests unit_test.cpp)
+
+# Link the test executable to the source code and the GTest library
+target_link_libraries(unit_tests
+    PRIVATE
+    GTest::gtest_main
+    ${PROJECT_NAME}::app_binary # Optional: Link to the main application target
+    # If the app logic is in a library, link to that library
+)
+
+# ------------------------------------------------------------------
+# Configure CTest for Reporting
+# ------------------------------------------------------------------
+# This command defines a test job that CTest will execute.
+# The `unit_test` job in .gitlab-ci.yml will run `ctest --output-junit results.xml`
+# which executes this test and captures the output in the required XML format.
+add_test(NAME run_unit_tests
+    COMMAND unit_tests
+)
+
+# Set the properties for the test to ensure CTest runs correctly
+set_tests_properties(run_unit_tests
+    PROPERTIES
+    _gtest_discover_tests TRUE # Mandatory for GTest
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+===========================================================================================================================
+tests/unit_test.cpp : This code runs the tests and allows ctest to generate the XML report.
+===========================================================================================================================
+// my-cpp-app/tests/unit_test.cpp
+
+#include <gtest/gtest.h>
+#include "../src/calculator.h"
+
+// Define a simple test suite
+TEST(CalculatorTest, HandlesAddition) {
+    Calculator calc;
+    // Assertion that will pass
+    ASSERT_EQ(calc.add(5, 3), 8);
+}
+
+TEST(CalculatorTest, HandlesSubtraction) {
+    Calculator calc;
+    // Assertion that will pass (covers the 'if (a > b)' branch)
+    ASSERT_EQ(calc.subtract(10, 4), 6); 
+    
+    // NOTE: Testing calc.subtract(4, 10) would cover the 'else' branch, 
+    // but we omit it here so the coverage report shows incomplete coverage.
+}
+
+int main(int argc, char **argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}
+===========================================================================================================================
+===========================================================================================================================
+This setup ensures that when the GitLab Runner executes:
+
+prepare: cmake .. -DENABLE_COVERAGE=ON
+
+build: cmake --build . (compiles unit_tests and app_binary)
+
+test: ctest --output-junit results.xml (runs the tests and creates the JUnit report)
+
+test: gcovr --xml-pretty --cobertura --output coverage.xml (uses the coverage data from the build to create the Cobertura report)
+
+The required reports will be generated and uploaded as artifacts for GitLab to display.
+===========================================================================================================================
+
+
+
