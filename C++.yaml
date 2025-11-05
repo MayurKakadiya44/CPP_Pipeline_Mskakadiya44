@@ -1,0 +1,195 @@
+# ----------------------------------------------------------------------
+# GLOBAL CONFIGURATION & CACHE
+# ----------------------------------------------------------------------
+# Use a specific, official image with C++ tools
+image: registry.gitlab.com/gitlab-org/build/cxx-latest:latest
+
+variables:
+  # Standardized CMake build directory
+  BUILD_DIR: cmake-build
+  # Define the target branch for deployment rules
+  MAIN_BRANCH: main
+
+# Define dependencies that are slow to download/build
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - $BUILD_DIR/
+    - external/dependencies/ # Cache downloaded external libs (e.g., vcpkg artifacts)
+
+# Define the full set of stages
+stages:
+  - prepare              # Dependency management, initial setup
+  - security             # SAST/Dependency Scanning
+  - quality              # Linting, style, code coverage
+  - build                # Compile the application
+  - test                 # Run unit/integration tests
+  - package              # Create Docker image
+  - deploy_review        # Review App deployment (for Merge Requests)
+  - deploy_staging       # Automated staging deployment
+  - deploy_production    # Manual production deployment
+
+# ----------------------------------------------------------------------
+# CI Templates for Security (Best Practice: Use GitLab's built-in templates)
+# ----------------------------------------------------------------------
+include:
+  # Static Application Security Testing (SAST)
+  - template: Security/SAST.gitlab-ci.yml
+  # Dependency Scanning (DS) - Important for C++ dependencies
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+
+
+# ----------------------------------------------------------------------
+# STAGE 1: PREPARE (Use a single job for all slow setup steps)
+# ----------------------------------------------------------------------
+prepare_dependencies:
+  stage: prepare
+  script:
+    - mkdir -p $BUILD_DIR
+    - cd $BUILD_DIR
+    # 1. Configure for a debug/coverage build
+    - cmake .. -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON
+  # Cache the configured build directory for faster subsequent stages
+  artifacts:
+    paths:
+      - $BUILD_DIR/
+    expire_in: 1 day
+
+# ----------------------------------------------------------------------
+# STAGE 4: BUILD (Matrix Build for different OS/Architectures)
+# ----------------------------------------------------------------------
+build_app:
+  stage: build
+  # Matrix job: Run the build across multiple OS images in parallel
+  parallel:
+    matrix:
+      - IMAGE: [gcc:12, clang:16]
+  image: $IMAGE
+  script:
+    # Build only the application, not the tests yet
+    - cmake --build $BUILD_DIR --target app_binary
+  dependencies:
+    - prepare_dependencies
+  artifacts:
+    paths:
+      - $BUILD_DIR/app_binary # Save only the application binary
+    expire_in: 1 day
+
+# ----------------------------------------------------------------------
+# STAGE 3: QUALITY (Static Analysis & Linting)
+# ----------------------------------------------------------------------
+code_quality:
+  stage: quality
+  # This job must be allowed to fail (allow_failure: true) so it doesn't block the pipeline, 
+  # but the report still shows up in the MR widget.
+  allow_failure: true
+  script:
+    # Example: Run Clang-Tidy (or similar linter)
+    - clang-tidy -p $BUILD_DIR $(find src -name "*.cpp") -export-fixes=clang-tidy-report.yml
+  artifacts:
+    reports:
+      # Export the report to display issues in the MR widget
+      codequality: clang-tidy-report.yml
+
+# ----------------------------------------------------------------------
+# STAGE 5: TEST (Unit Tests & Coverage)
+# ----------------------------------------------------------------------
+unit_test:
+  stage: test
+  script:
+    - cd $BUILD_DIR
+    # 1. Run CTest (which executes the test binary)
+    - ctest --output-on-failure --output-junit results.xml
+    # 2. Generate Cobertura report (requires gcov/lcov/gcovr)
+    - gcovr --xml-pretty --cobertura --output coverage.xml --root ..
+  dependencies:
+    - build_app # Depend on the successful build
+  artifacts:
+    reports:
+      # Display test results in the MR widget
+      junit: $BUILD_DIR/results.xml
+      # Display line-by-line coverage in the MR diff
+      coverage_report:
+        coverage_format: cobertura
+        path: $BUILD_DIR/coverage.xml
+  # Use a regex to extract the percentage for the MR badge
+  coverage: '/Lines:\s+\d+\.\d+\%/'
+  
+# ----------------------------------------------------------------------
+# STAGE 6: PACKAGE (Containerization)
+# ----------------------------------------------------------------------
+package_docker:
+  stage: package
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - >
+      docker build
+      --build-arg BUILD_DIR=$BUILD_DIR
+      -t $CI_REGISTRY/$CI_PROJECT_PATH/app:$CI_COMMIT_SHORT_SHA
+      .
+    - docker push $CI_REGISTRY/$CI_PROJECT_PATH/app:$CI_COMMIT_SHORT_SHA
+  # Exclude from running on merge request pipelines
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# ----------------------------------------------------------------------
+# STAGE 7: DEPLOY REVIEW (Ephemeral Environments)
+# ----------------------------------------------------------------------
+deploy_review:
+  stage: deploy_review
+  # Only runs for Merge Requests (MRs)
+  rules:
+    - if: $CI_MERGE_REQUEST_IID
+  script:
+    - echo "Deploying Review App for MR $CI_MERGE_REQUEST_IID to K8s..."
+    # A real script would use 'kubectl' or 'helm' with the specific MR branch/ID
+  environment:
+    name: review/$CI_COMMIT_REF_NAME # Unique environment name per branch
+    url: https://$CI_COMMIT_REF_SLUG.review.example.com
+    on_stop: stop_review
+    auto_stop_in: 1 week
+
+stop_review:
+  stage: deploy_review
+  rules:
+    - if: $CI_MERGE_REQUEST_IID
+      when: manual
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - echo "Stopping Review App for MR $CI_MERGE_REQUEST_IID..."
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    action: stop
+
+# ----------------------------------------------------------------------
+# STAGE 8 & 9: DEPLOY STAGING/PRODUCTION
+# ----------------------------------------------------------------------
+.deploy_template: &deploy_definition
+  image: alpine/k8s:1.27.3
+  script:
+    - echo "Deploying image $CI_REGISTRY/$CI_PROJECT_PATH/app:$CI_COMMIT_SHORT_SHA"
+    # Placeholder for actual deployment logic (e.g., Helm upgrade or kubectl apply)
+
+deploy_staging:
+  <<: *deploy_definition
+  stage: deploy_staging
+  rules:
+    - if: $CI_COMMIT_BRANCH == $MAIN_BRANCH
+  environment:
+    name: staging
+    url: https://staging.example.com
+
+deploy_production:
+  <<: *deploy_definition
+  stage: deploy_production
+  # Manual gate, only on main branch
+  when: manual
+  rules:
+    - if: $CI_COMMIT_BRANCH == $MAIN_BRANCH
+  environment:
+    name: production
+    url: https://app.example.com
